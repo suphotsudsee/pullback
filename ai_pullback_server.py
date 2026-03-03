@@ -37,6 +37,7 @@ MT4_FILES_DIR      = os.getenv(
     r"C:\Users\user\AppData\Roaming\MetaQuotes\Terminal\C419E35F6EFCAC731FACC09E5EB1D6BB\MQL4\Files"
 )
 MT4_MARKET_FILE    = os.getenv("MT4_MARKET_FILE", "pullback_market_data.json")
+MT4_COMMAND_FILE   = os.getenv("MT4_COMMAND_FILE", "pullback_command.json")
 FILE_POLL_SEC      = float(os.getenv("FILE_POLL_SEC", "0.25"))
 
 FIXED_LOT          = 0.01
@@ -79,6 +80,19 @@ _daily_date    = None
 _daily_trades  = 0
 _daily_blocked = False
 _last_file_mtime_ns = -1
+
+
+def write_command_file(cmd: dict) -> None:
+    try:
+        os.makedirs(MT4_FILES_DIR, exist_ok=True)
+        path = os.path.join(MT4_FILES_DIR, MT4_COMMAND_FILE)
+        payload = dict(cmd)
+        payload.setdefault("cmd_id", str(int(time.time() * 1000)))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        log.info(f"Command file updated: {path} | action={payload.get('action')}")
+    except Exception as e:
+        log.error(f"Command file write error: {e}")
 
 
 # 
@@ -241,8 +255,10 @@ def queue_command_if_valid(cmd: dict, data: dict, source: str) -> None:
 
     cmd["action"] = action
     cmd["lots"] = FIXED_LOT
+    cmd["cmd_id"] = str(int(time.time() * 1000))
     with command_lock:
         pending_command = cmd
+    write_command_file(cmd)
     log.info(f"{source} command queued: {cmd}")
 
 
@@ -371,8 +387,10 @@ def manual_order():
         "confidence":    100,
     }
 
+    cmd["cmd_id"] = str(int(time.time() * 1000))
     with command_lock:
         pending_command = cmd
+    write_command_file(cmd)
 
     log.info(f"Manual {action} queued, waiting for EA poll")
     return jsonify({"status": "queued", "action": action})
@@ -878,9 +896,6 @@ td{{padding:5px 8px;border-bottom:1px solid #0f172a}}
 async function sendManual(action) {{
   const btn = document.getElementById('btn-' + action.toLowerCase());
   const status = document.getElementById('order-status');
-
-  const labels = {{BUY:'BUY XAUUSD', SELL:'SELL XAUUSD', CLOSE:'CLOSE ALL'}};
-  if (!confirm(labels[action] + '\\nSL/TP are auto-calculated from ATR\\n\\nConfirm?')) return;
 
   // Disable buttons while request is in-flight
   ['buy','sell','close'].forEach(b => {{

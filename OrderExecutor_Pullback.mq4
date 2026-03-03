@@ -19,6 +19,9 @@ input int      PollInterval      = 3;
 input int      MagicNumber       = 55555;
 input int      MaxSlippage       = 50;
 input bool     EnableTrading     = true;
+input bool     ReadCommandFromFile = true;
+input string   CommandFileName     = "pullback_command.json";
+input bool     UseCommonFiles      = false;
 
 // ATR settings
 input int      ATR_Period        = 14;
@@ -46,6 +49,32 @@ double   g_StartBalance  = 0;
 int      g_DailyTrades   = 0;
 datetime g_LastDay       = 0;
 bool     g_DailyBlocked  = false;
+string   g_LastCmdID     = "";
+
+bool ReadCommandFromFileBridge(string &outJson)
+{
+   int flags = FILE_READ | FILE_TXT | FILE_ANSI;
+   if(UseCommonFiles) flags |= FILE_COMMON;
+
+   int h = FileOpen(CommandFileName, flags);
+   if(h == INVALID_HANDLE) return false;
+
+   int sz = (int)FileSize(h);
+   if(sz <= 0) { FileClose(h); return false; }
+   outJson = FileReadString(h, sz);
+   FileClose(h);
+   return StringLen(outJson) > 4;
+}
+
+void ClearCommandFileBridge()
+{
+   int flags = FILE_WRITE | FILE_TXT | FILE_ANSI;
+   if(UseCommonFiles) flags |= FILE_COMMON;
+   int h = FileOpen(CommandFileName, flags);
+   if(h == INVALID_HANDLE) return;
+   FileWriteString(h, "{\"action\":\"none\"}\r\n");
+   FileClose(h);
+}
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -77,6 +106,21 @@ void OnTimer()
    if(UseBreakEven)    RunBreakEven();
 
    if(!PassRiskCheck()) return;
+
+   if(ReadCommandFromFile) {
+      string fjson = "";
+      if(ReadCommandFromFileBridge(fjson)) {
+         if(StringFind(fjson, "\"none\"") < 0) {
+            string cmdId = ExtractString(fjson, "cmd_id");
+            if(StringLen(cmdId) == 0 || cmdId != g_LastCmdID) {
+               if(StringLen(cmdId) > 0) g_LastCmdID = cmdId;
+               ProcessCommand(fjson);
+               ClearCommandFileBridge();
+               return;
+            }
+         }
+      }
+   }
 
    // Poll AI command
    string url = ServerURL + "/get_command?magic=" + IntegerToString(MagicNumber);
