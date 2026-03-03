@@ -38,14 +38,14 @@ MT4_FILES_DIR      = os.getenv(
 )
 MT4_MARKET_FILE    = os.getenv("MT4_MARKET_FILE", "pullback_market_data.json")
 MT4_COMMAND_FILE   = os.getenv("MT4_COMMAND_FILE", "pullback_command.json")
-FILE_POLL_SEC      = float(os.getenv("FILE_POLL_SEC", "0.25"))
-ORDER_ACK_TIMEOUT_SEC = int(os.getenv("ORDER_ACK_TIMEOUT_SEC", "12"))
+FILE_POLL_SEC      = float(os.getenv("FILE_POLL_SEC", "0.05"))
+ORDER_ACK_TIMEOUT_SEC = int(os.getenv("ORDER_ACK_TIMEOUT_SEC", "8"))
 
 FIXED_LOT          = 0.01
 MAX_DAILY_TRADES   = 3
 MAX_LOSS_PERCENT   = 10.0
 MIN_CONFIDENCE     = 75        # Minimum confidence required for MTF pullback setup
-MIN_INTERVAL_SEC   = 60        # Analyze at most once every 60 seconds
+MIN_INTERVAL_SEC   = 15        # Analyze at most once every 15 seconds
 AI_COOLDOWN_SEC    = 300       # Pause AI calls for 5 minutes after HTTP 429
 USE_RULE_FALLBACK_ON_AI_ERROR = True
 RULE_MIN_CONFIDENCE = int(os.getenv("RULE_MIN_CONFIDENCE", "72"))
@@ -798,7 +798,7 @@ def dashboard():
     blocked_html = f"<div class='alert'>{blocked_msg}</div>" if (_daily_blocked or ai_block) else ""
 
     return f"""<!DOCTYPE html><html><head>
-<meta http-equiv="refresh" content="3">
+<meta http-equiv="refresh" content="1">
 <title>XAUUSD Pullback AI</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -977,7 +977,7 @@ td{{padding:5px 8px;border-bottom:1px solid #0f172a}}
     {rows if rows else "<tr><td colspan='4' style='color:#334155;text-align:center;padding:12px'>No trades yet today</td></tr>"}
   </table>
 </div>
-<p style="margin-top:8px;color:#1e293b;font-size:10px">Auto refresh 3s</p>
+<p style="margin-top:8px;color:#1e293b;font-size:10px">Auto refresh 1s</p>
 
 <script>
 async function sendManual(action) {{
@@ -1025,13 +1025,13 @@ async function sendManual(action) {{
     status.textContent = 'Server error: ' + e.message;
   }}
 
-  // Re-enable buttons after 4 seconds
+  // Re-enable buttons quickly for rapid retries
   setTimeout(() => {{
     ['buy','sell','close'].forEach(b => {{
       document.getElementById('btn-' + b).disabled = false;
       document.getElementById('btn-' + b).style.opacity = '1';
     }});
-  }}, 4000);
+  }}, 1200);
 }}
 
 async function waitOrderResult(expectedAction) {{
@@ -1046,7 +1046,7 @@ async function waitOrderResult(expectedAction) {{
       const act = (s.action || '').toUpperCase();
 
       if (act && act !== '-' && act !== expectedAction) {{
-        await new Promise(x => setTimeout(x, 800));
+        await new Promise(x => setTimeout(x, 250));
         continue;
       }}
 
@@ -1068,7 +1068,7 @@ async function waitOrderResult(expectedAction) {{
         status.textContent = 'SENT TO EA | ' + s.action + ' | waiting broker response...';
       }}
     }} catch (e) {{}}
-    await new Promise(x => setTimeout(x, 1000));
+    await new Promise(x => setTimeout(x, 250));
   }}
   status.style.background = '#451a03';
   status.style.color = '#fed7aa';

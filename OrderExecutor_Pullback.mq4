@@ -15,7 +15,7 @@
 
 // Inputs
 input string   ServerURL         = "http://127.0.0.1:5000";
-input int      PollInterval      = 3;
+input int      PollInterval      = 1;
 input int      MagicNumber       = 55555;
 input int      MaxSlippage       = 50;
 input bool     EnableTrading     = true;
