@@ -28,16 +28,26 @@ import requests
 # 
 #  CONFIG
 # 
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SERVER_HOST        = "0.0.0.0"
 SERVER_PORT        = 5000
+MT4_FILES_DIR      = os.getenv(
+    "MT4_FILES_DIR",
+    r"C:\Users\user\AppData\Roaming\MetaQuotes\Terminal\C419E35F6EFCAC731FACC09E5EB1D6BB\MQL4\Files"
+)
+MT4_MARKET_FILE    = os.getenv("MT4_MARKET_FILE", "pullback_market_data.json")
+FILE_POLL_SEC      = float(os.getenv("FILE_POLL_SEC", "0.25"))
 
 FIXED_LOT          = 0.01
 MAX_DAILY_TRADES   = 3
 MAX_LOSS_PERCENT   = 10.0
 MIN_CONFIDENCE     = 75        # Minimum confidence required for MTF pullback setup
 MIN_INTERVAL_SEC   = 60        # Analyze at most once every 60 seconds
+AI_COOLDOWN_SEC    = 300       # Pause AI calls for 5 minutes after HTTP 429
+USE_RULE_FALLBACK_ON_AI_ERROR = True
+RULE_MIN_CONFIDENCE = int(os.getenv("RULE_MIN_CONFIDENCE", "72"))
+RULE_ALIGN_CONFIDENCE = int(os.getenv("RULE_ALIGN_CONFIDENCE", "76"))
 MIN_ATR_M5         = 1.5
 MAX_SPREAD_USD     = 3.0
 
@@ -63,10 +73,12 @@ command_lock       = threading.Lock()
 market_history     = []
 trade_log          = []
 ai_analysis_cache  = {}      # Latest analysis text shown on dashboard
+ai_cooldown_until  = 0
 
 _daily_date    = None
 _daily_trades  = 0
 _daily_blocked = False
+_last_file_mtime_ns = -1
 
 
 # 
@@ -105,19 +117,11 @@ def risk_check(data: dict) -> tuple[bool, str]:
     return True, "ok"
 
 
-# 
-#  ENDPOINTS
-# 
-@app.route("/market_data", methods=["POST"])
-def receive_market_data():
-    global last_analysis_time, pending_command
-    data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"status": "error"}), 400
-
+def process_market_data(data: dict, source: str = "http") -> None:
+    global last_analysis_time
     m5 = data.get("m5", {})
     log.info(
-        f" {data.get('bid','?')} | "
+        f"[{source}] {data.get('bid','?')} | "
         f"ATR_M5=${float(m5.get('atr',0) or 0):.2f} | "
         f"RSI_M5={m5.get('rsi','?')} | "
         f"Spread=${float(data.get('spread_usd',0) or 0):.2f}"
@@ -127,18 +131,178 @@ def receive_market_data():
     if len(market_history) > 30:
         market_history.pop(0)
 
+    now = time.time()
+    if now - last_analysis_time >= MIN_INTERVAL_SEC:
+        last_analysis_time = now
+        t = threading.Thread(target=analyze_pullback, args=(data,), daemon=True)
+        t.start()
+
+
+def build_rule_based_command(data: dict) -> dict:
+    bid = float(data.get("bid", 0) or 0)
+    h4 = data.get("h4", {}) or {}
+    h1 = data.get("h1", {}) or {}
+    m15 = data.get("m15", {}) or {}
+    m5 = data.get("m5", {}) or {}
+
+    def tf_trend(tf_data: dict) -> str:
+        e20 = float(tf_data.get("ema20", bid) or bid)
+        e50 = float(tf_data.get("ema50", bid) or bid)
+        e200 = float(tf_data.get("ema200", bid) or bid)
+        if e20 > e50 > e200:
+            return "UP"
+        if e20 < e50 < e200:
+            return "DOWN"
+        return "MIXED"
+
+    h4_t = tf_trend(h4)
+    h1_t = tf_trend(h1)
+    m15_t = tf_trend(m15)
+    m5_t = tf_trend(m5)
+
+    m5_rsi = float(m5.get("rsi", 50) or 50)
+    m5_stoch = float(m5.get("stoch_k", 50) or 50)
+    m5_macd_m = float(m5.get("macd_m", 0) or 0)
+    m5_macd_s = float(m5.get("macd_s", 0) or 0)
+    m5_close = float(m5.get("last_close", bid) or bid)
+    m5_prev = float(m5.get("prev_close", bid) or bid)
+    m5_ema20 = float(m5.get("ema20", bid) or bid)
+
+    buy_score = 0
+    sell_score = 0
+    if m5_close > m5_prev:
+        buy_score += 1
+    if m5_close > m5_ema20:
+        buy_score += 1
+    if m5_rsi >= 48:
+        buy_score += 1
+    if m5_stoch >= 45:
+        buy_score += 1
+    if m5_macd_m >= m5_macd_s:
+        buy_score += 1
+
+    if m5_close < m5_prev:
+        sell_score += 1
+    if m5_close < m5_ema20:
+        sell_score += 1
+    if m5_rsi <= 52:
+        sell_score += 1
+    if m5_stoch <= 55:
+        sell_score += 1
+    if m5_macd_m <= m5_macd_s:
+        sell_score += 1
+
+    up_align = h4_t == "UP" and h1_t == "UP" and m15_t != "DOWN"
+    down_align = h4_t == "DOWN" and h1_t == "DOWN" and m15_t != "UP"
+
+    cmd = {
+        "action": "none",
+        "setup": "RULE_FALLBACK",
+        "h4_bias": "BULLISH" if h4_t == "UP" else ("BEARISH" if h4_t == "DOWN" else "NEUTRAL"),
+        "h1_zone": f"H1={h1_t} M15={m15_t}",
+        "m5_signal": f"RSI={m5_rsi:.1f} Stoch={m5_stoch:.1f} MACD={m5_macd_m:.4f}/{m5_macd_s:.4f} scoreB={buy_score}/5 scoreS={sell_score}/5",
+        "confidence": 55,
+        "reason": "No aligned rule-based setup"
+    }
+
+    if up_align and buy_score >= 4:
+        cmd["action"] = "BUY"
+        cmd["confidence"] = RULE_ALIGN_CONFIDENCE
+        cmd["reason"] = f"H4/H1 uptrend alignment with M5 bullish score {buy_score}/5"
+    elif down_align and sell_score >= 4:
+        cmd["action"] = "SELL"
+        cmd["confidence"] = RULE_ALIGN_CONFIDENCE
+        cmd["reason"] = f"H4/H1 downtrend alignment with M5 bearish score {sell_score}/5"
+    elif h4_t == "UP" and buy_score == 5 and h1_t != "DOWN":
+        cmd["action"] = "BUY"
+        cmd["confidence"] = RULE_MIN_CONFIDENCE
+        cmd["reason"] = "Strong M5 bullish trigger with higher-timeframe support"
+    elif h4_t == "DOWN" and sell_score == 5 and h1_t != "UP":
+        cmd["action"] = "SELL"
+        cmd["confidence"] = RULE_MIN_CONFIDENCE
+        cmd["reason"] = "Strong M5 bearish trigger with higher-timeframe support"
+
+    return cmd
+
+
+def queue_command_if_valid(cmd: dict, data: dict, source: str) -> None:
+    global pending_command
+    if not cmd:
+        return
+
+    action = str(cmd.get("action", "none")).upper()
+    confidence = int(cmd.get("confidence", 0) or 0)
+    if action not in ("BUY", "SELL", "CLOSE") or confidence < MIN_CONFIDENCE:
+        return
+
+    open_pos = int((data.get("account", {}) or {}).get("open_pos", 0) or 0)
+    if action in ("BUY", "SELL") and open_pos >= MAX_DAILY_TRADES:
+        return
+
+    cmd["action"] = action
+    cmd["lots"] = FIXED_LOT
+    with command_lock:
+        pending_command = cmd
+    log.info(f"{source} command queued: {cmd}")
+
+
+def watch_mt4_file() -> None:
+    global _last_file_mtime_ns
+    file_path = os.path.join(MT4_FILES_DIR, MT4_MARKET_FILE)
+    log.info(f"FileBridge watch: {file_path}")
+
+    while True:
+        try:
+            if not os.path.exists(file_path):
+                time.sleep(FILE_POLL_SEC)
+                continue
+
+            stat = os.stat(file_path)
+            if stat.st_mtime_ns == _last_file_mtime_ns:
+                time.sleep(FILE_POLL_SEC)
+                continue
+
+            _last_file_mtime_ns = stat.st_mtime_ns
+            with open(file_path, "r", encoding="utf-8-sig") as f:
+                raw = f.read().strip()
+
+            if not raw:
+                time.sleep(FILE_POLL_SEC)
+                continue
+
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                process_market_data(data, source="file")
+            else:
+                log.warning("FileBridge ignored non-object JSON payload")
+        except json.JSONDecodeError:
+            # EA อาจกำลังเขียนไฟล์อยู่ จึงรอรอบถัดไป
+            time.sleep(FILE_POLL_SEC)
+            continue
+        except Exception as e:
+            log.error(f"FileBridge error: {e}")
+
+        time.sleep(FILE_POLL_SEC)
+
+
+# 
+#  ENDPOINTS
+# 
+@app.route("/market_data", methods=["POST"])
+def receive_market_data():
+    global pending_command
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"status": "error"}), 400
+
+    process_market_data(data, source="http")
+
     with command_lock:
         if pending_command:
             cmd = pending_command
             pending_command = None
             log.info(f"Dispatch command: {cmd}")
             return jsonify(cmd)
-
-    now = time.time()
-    if now - last_analysis_time >= MIN_INTERVAL_SEC:
-        last_analysis_time = now
-        t = threading.Thread(target=analyze_pullback, args=(data,), daemon=True)
-        t.start()
 
     return jsonify({"status": "ok", "action": "none"})
 
@@ -218,12 +382,29 @@ def manual_order():
 #  PULLBACK ANALYSIS
 # 
 def analyze_pullback(data: dict):
-    global pending_command, ai_analysis_cache
+    global ai_analysis_cache, ai_cooldown_until
 
     allowed, reason = risk_check(data)
     if not allowed:
         log.info(f"Blocked: {reason}")
         ai_analysis_cache["block_reason"] = reason
+        return
+
+    now = time.time()
+    if now < ai_cooldown_until:
+        wait_sec = int(ai_cooldown_until - now)
+        msg = f"OpenAI cooldown active ({wait_sec}s left) after rate limit"
+        log.warning(msg)
+        if USE_RULE_FALLBACK_ON_AI_ERROR:
+            fallback_cmd = build_rule_based_command(data)
+            ai_analysis_cache = {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "response": json.dumps(fallback_cmd, ensure_ascii=False),
+                "block_reason": msg
+            }
+            queue_command_if_valid(fallback_cmd, data, source="RuleFallback")
+        else:
+            ai_analysis_cache["block_reason"] = msg
         return
 
     try:
@@ -240,14 +421,44 @@ def analyze_pullback(data: dict):
         }
 
         cmd = parse_response(response, data)
-        if cmd and cmd.get("action") not in ("none", None):
-            cmd["lots"] = FIXED_LOT
-            with command_lock:
-                pending_command = cmd
-            log.info(f"Pullback command queued: {cmd}")
+        queue_command_if_valid(cmd, data, source="AI")
 
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status == 429:
+            ai_cooldown_until = time.time() + AI_COOLDOWN_SEC
+            msg = f"OpenAI 429 rate limit. Cooldown {AI_COOLDOWN_SEC}s"
+            log.warning(msg)
+            if USE_RULE_FALLBACK_ON_AI_ERROR:
+                fallback_cmd = build_rule_based_command(data)
+                ai_analysis_cache = {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "response": json.dumps(fallback_cmd, ensure_ascii=False),
+                    "block_reason": msg
+                }
+                queue_command_if_valid(fallback_cmd, data, source="RuleFallback")
+            else:
+                ai_analysis_cache["block_reason"] = msg
+            return
+        log.error(f" OpenAI HTTP error: {e}")
+        if USE_RULE_FALLBACK_ON_AI_ERROR:
+            fallback_cmd = build_rule_based_command(data)
+            ai_analysis_cache = {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "response": json.dumps(fallback_cmd, ensure_ascii=False),
+                "block_reason": "OpenAI HTTP error -> rule fallback"
+            }
+            queue_command_if_valid(fallback_cmd, data, source="RuleFallback")
     except Exception as e:
         log.error(f" Error: {e}")
+        if USE_RULE_FALLBACK_ON_AI_ERROR:
+            fallback_cmd = build_rule_based_command(data)
+            ai_analysis_cache = {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "response": json.dumps(fallback_cmd, ensure_ascii=False),
+                "block_reason": "OpenAI error -> rule fallback"
+            }
+            queue_command_if_valid(fallback_cmd, data, source="RuleFallback")
 
 
 # 
@@ -384,6 +595,9 @@ def call_openai(prompt: str) -> str:
     }
     r = requests.post("https://api.openai.com/v1/chat/completions",
                       headers=headers, json=body, timeout=30)
+    if r.status_code >= 400:
+        msg = r.text[:800]
+        raise requests.HTTPError(f"OpenAI HTTP {r.status_code}: {msg}", response=r)
     r.raise_for_status()
     data = r.json()
     content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -739,5 +953,7 @@ if __name__ == "__main__":
     log.info("   Logic  : H4 -> H1 -> M15 -> M5 Pullback Entry")
     log.info(f"   Conf   : >= {MIN_CONFIDENCE}%  |  Interval: {MIN_INTERVAL_SEC}s")
     log.info(f"   SL=ATR x {SL_ATR_MULTI} | TP=ATR x {TP_ATR_MULTI}")
+    log.info(f"   File   : {os.path.join(MT4_FILES_DIR, MT4_MARKET_FILE)}")
+    watcher = threading.Thread(target=watch_mt4_file, daemon=True)
+    watcher.start()
     app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
-

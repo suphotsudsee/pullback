@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|  DataSender_MTF.mq4                                              |
-//|  Multi-Timeframe Data Sender for XAUUSD Pullback               |
-//|  Sends H4, H1, M15, and M5 data to local AI server            |
+//|  Multi-Timeframe Data Sender สำหรับ XAUUSD Pullback             |
+//|  ส่งข้อมูล H4, H1, M15, M5 พร้อมกัน                            |
 //|  v5.0                                                            |
 //+------------------------------------------------------------------+
 #property copyright "AI XAUUSD Pullback System"
@@ -9,50 +9,134 @@
 #property strict
 
 input string   ServerURL     = "http://127.0.0.1:5000";
-input int      SendInterval  = 3;    // Send every 3 seconds
-input int      CandleCount   = 30;   // Candle count per timeframe
+input string   FallbackURL1  = "http://localhost:5000";
+input string   FallbackURL2  = "";
+input string   FallbackURL3  = "";
+input int      SendInterval  = 3;    // ส่งทุก 3 วินาที (M5 ไม่ต้องเร็วมาก)
+input int      CandleCount   = 30;   // candle ต่อ timeframe
+input bool     EnableFallback = true;
+input bool     WriteToFileBridge = true;                 // เขียน JSON ลง MQL4\Files
+input string   OutputFileName    = "pullback_market_data.json";
+input bool     UseCommonFiles    = false;                // true = เขียนที่ Terminal\Common\Files
+input bool     SendToServer      = false;                // ปิด WebRequest ถ้าใช้โหมดไฟล์อย่างเดียว
 
 double   g_StartBalance = 0;
 datetime g_LastDay      = 0;
 string   g_ServerURL    = "";
-string   g_AltServerURL = "";
+string   g_WhitelistURL = "";
+string   g_ServerList[4];
+string   g_WhitelistList[4];
+int      g_ServerCount  = 0;
+int      g_ServerIndex  = 0;
 
-string NormalizeBaseURL(string url)
+bool WriteJSONToFile(string json)
 {
-   StringReplace(url, " ", "");
-   StringReplace(url, "\t", "");
-   StringReplace(url, "\r", "");
-   StringReplace(url, "\n", "");
-   StringReplace(url, "\"", "");
-   StringReplace(url, "'", "");
-   while(StringLen(url) > 0 && StringGetChar(url, StringLen(url)-1) == '/')
+   int flags = FILE_WRITE | FILE_TXT | FILE_ANSI;
+   if(UseCommonFiles) flags |= FILE_COMMON;
+
+   int handle = FileOpen(OutputFileName, flags);
+   if(handle == INVALID_HANDLE) {
+      int err = GetLastError();
+      Print("❌ เขียนไฟล์ไม่สำเร็จ: ", OutputFileName, " | Err=", err);
+      return false;
+   }
+
+   FileWriteString(handle, json);
+   FileWriteString(handle, "\r\n");
+   FileClose(handle);
+   return true;
+}
+
+string NormalizeServerURL(string url)
+{
+   while(StringLen(url) > 0 && StringSubstr(url, StringLen(url)-1, 1) == "/")
       url = StringSubstr(url, 0, StringLen(url)-1);
    return url;
+}
+
+string ExtractWhitelistBase(string url)
+{
+   int p = StringFind(url, "://");
+   if(p < 0) return url;
+
+   int hostStart = p + 3;
+   int slash     = StringFind(url, "/", hostStart);
+   if(slash > 0) return StringSubstr(url, 0, slash);
+   return url;
+}
+
+bool URLExists(string url)
+{
+   for(int i=0; i<g_ServerCount; i++)
+      if(g_ServerList[i] == url) return true;
+   return false;
+}
+
+void AddServerCandidate(string url)
+{
+   string n = NormalizeServerURL(url);
+   if(StringLen(n) == 0) return;
+   if(URLExists(n)) return;
+   if(g_ServerCount >= ArraySize(g_ServerList)) return;
+
+   g_ServerList[g_ServerCount] = n;
+   g_WhitelistList[g_ServerCount] = ExtractWhitelistBase(n);
+   g_ServerCount++;
+}
+
+void ActivateServer(int idx)
+{
+   if(idx < 0 || idx >= g_ServerCount) return;
+   g_ServerIndex  = idx;
+   g_ServerURL    = g_ServerList[idx];
+   g_WhitelistURL = g_WhitelistList[idx];
+}
+
+bool SwitchToNextServer()
+{
+   if(g_ServerCount <= 1) return false;
+   int old = g_ServerIndex;
+   int next = (g_ServerIndex + 1) % g_ServerCount;
+   if(next == old) return false;
+   ActivateServer(next);
+   Print("↪️ Fallback ไป URL ถัดไป: ", g_ServerURL, " (Whitelist: ", g_WhitelistURL, ")");
+   return true;
 }
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
    if(StringFind(Symbol(), "XAU") < 0 && StringFind(Symbol(), "GOLD") < 0)
-      Print("Warning: This EA is designed for XAUUSD.");
+      Print("⚠️ Warning: ออกแบบสำหรับ XAUUSD");
+
+   g_ServerCount = 0;
+   AddServerCandidate(ServerURL);
+   AddServerCandidate(FallbackURL1);
+   AddServerCandidate(FallbackURL2);
+   AddServerCandidate(FallbackURL3);
+   if(g_ServerCount == 0) AddServerCandidate("http://127.0.0.1:5000");
+   ActivateServer(0);
 
    g_StartBalance = AccountBalance();
    g_LastDay      = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
-
-   g_ServerURL = NormalizeBaseURL(ServerURL);
-   g_AltServerURL = g_ServerURL;
-   if(StringFind(g_AltServerURL, "127.0.0.1") >= 0)
-      StringReplace(g_AltServerURL, "127.0.0.1", "localhost");
-   else if(StringFind(g_AltServerURL, "localhost") >= 0)
-      StringReplace(g_AltServerURL, "localhost", "127.0.0.1");
-
    EventSetTimer(SendInterval);
 
-   Print("MTF DataSender v5 started.");
+   Print("✅ MTF DataSender v5 เริ่มทำงาน");
    Print("   Timeframes: H4, H1, M15, M5");
    Print("   Strategy  : Pullback Entry");
-   Print("   ServerURL : ", g_ServerURL);
-   if(g_AltServerURL != g_ServerURL) Print("   AltURL    : ", g_AltServerURL);
+   if(WriteToFileBridge) {
+      string basePath = TerminalInfoString(TERMINAL_DATA_PATH) + "\\MQL4\\Files\\";
+      if(UseCommonFiles) basePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Files\\";
+      Print("   FileBridge: ", basePath, OutputFileName);
+   }
+   if(SendToServer) {
+      Print("   Server    : ", g_ServerURL, " (Whitelist: ", g_WhitelistURL, ")");
+      if(g_ServerCount > 1) {
+         Print("   Fallbacks : ", g_ServerCount, " URLs");
+         for(int i=0; i<g_ServerCount; i++)
+            Print("      [", i, "] ", g_ServerList[i], " (Whitelist: ", g_WhitelistList[i], ")");
+      }
+   }
    return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason) { EventKillTimer(); }
@@ -63,42 +147,65 @@ void OnTimer()
    CheckDailyReset();
    string json = BuildMTFJSON();
 
+   if(WriteToFileBridge) {
+      static bool g_fileOk = false;
+      bool ok = WriteJSONToFile(json);
+      if(ok && !g_fileOk) {
+         g_fileOk = true;
+         Print("🎉 File bridge พร้อมใช้งาน: ", OutputFileName);
+      }
+   }
+
+   if(!SendToServer) return;
+
    char   post[], result[];
    string resHdr, reqHdr = "Content-Type: application/json\r\n";
    ArrayResize(post, StringToCharArray(json, post, 0, WHOLE_ARRAY, CP_UTF8) - 1);
 
-   ResetLastError();
-   string endpoint = g_ServerURL + "/market_data";
-   int res = WebRequest("POST", endpoint, reqHdr, 8000, post, result, resHdr);
+   int res = -1;
+   int err = 0;
+   string endpoint = "";
+   int attempts = (EnableFallback ? g_ServerCount : 1);
+   if(attempts < 1) attempts = 1;
+
+   for(int a=0; a<attempts; a++)
+   {
+      endpoint = g_ServerURL + "/market_data";
+      ResetLastError();
+      res = WebRequest("POST", endpoint, reqHdr, 8000, post, result, resHdr);
+      err = GetLastError();
+      if(res == 200) break;
+
+      if(!EnableFallback || a >= attempts-1) break;
+      if(!SwitchToNextServer()) break;
+   }
+
    if(res == 200) {
+      static bool g_ok = false;
+      if(!g_ok) { g_ok=true; Print("🎉 เชื่อมต่อ Server สำเร็จ! URL=", g_ServerURL); }
       string resp = CharArrayToString(result);
       if(StringFind(resp, "\"none\"") < 0 && StringFind(resp, "\"action\"") >= 0)
-         Print("AI CMD: ", resp);
-   } else {
-      int err = GetLastError();
-      string respErr = CharArrayToString(result);
-      PrintFormat("WebRequest failed | HTTP=%d | LastError=%d | URL=%s | Resp=%s",
-                  res, err, endpoint, respErr);
-
-      // Fallback: some terminals reject one host format (127.0.0.1/localhost).
-      if(res == -1 && err == 5200 && g_AltServerURL != g_ServerURL) {
-         endpoint = g_AltServerURL + "/market_data";
-         ResetLastError();
-         res = WebRequest("POST", endpoint, reqHdr, 8000, post, result, resHdr);
-         if(res == 200) {
-            Print("WebRequest fallback success via ", endpoint);
-         } else {
-            err = GetLastError();
-            respErr = CharArrayToString(result);
-            PrintFormat("WebRequest fallback failed | HTTP=%d | LastError=%d | URL=%s | Resp=%s",
-                        res, err, endpoint, respErr);
-         }
-      }
-
-      if(res == -1)
-         Print("Hint: MT4 > Tools > Options > Expert Advisors > Allow WebRequest for listed URL: ", g_ServerURL);
+         Print("📨 AI CMD: ", resp);
+      return;
    }
+
+   static datetime g_lastWarn = 0;
+   if(TimeCurrent() - g_lastWarn < 15) return;
+   g_lastWarn = TimeCurrent();
+
+   string cause="", fix="";
+   if(err==5200){ cause="URL ไม่อยู่ใน MT4 Whitelist";
+                  fix="Tools > Options > Expert Advisors > Allow WebRequest > Add: "+g_WhitelistURL+" > OK > รีสตาร์ท MT4"; }
+   else if(err==5001){ cause="Python server ไม่รัน";
+                       fix="รัน: python ai_pullback_server.py"; }
+   else if(err==5004){ cause="Connection Refused";
+                       fix="ตรวจ Firewall / ตรวจ port 5000"; }
+   else { cause="Unknown"; fix="LastErr="+IntegerToString(err); }
+
+   Print("❌ WebRequest ล้มเหลว | HTTP=",res," Err=",err," | ",cause," | URL=",endpoint);
+   Print("   วิธีแก้: ",fix);
 }
+
 //+------------------------------------------------------------------+
 void CheckDailyReset()
 {
@@ -106,12 +213,12 @@ void CheckDailyReset()
    if(today > g_LastDay) {
       g_StartBalance = AccountBalance();
       g_LastDay      = today;
-      Print("New day reset. StartBal=", g_StartBalance);
+      Print("🌅 วันใหม่ StartBal=", g_StartBalance);
    }
 }
 
 //+------------------------------------------------------------------+
-//  BUILD JSON: send all timeframe payloads
+//  BUILD JSON — ส่งข้อมูลทุก Timeframe
 //+------------------------------------------------------------------+
 string BuildMTFJSON()
 {
@@ -137,16 +244,16 @@ string BuildMTFJSON()
    s += "\"daily_trades\":"  + IntegerToString(CountDailyTrades());
    s += "},";
 
-   //  H4 Data 
+   // ── H4 Data ──
    s += "\"h4\":" + BuildTFData(PERIOD_H4) + ",";
 
-   //  H1 Data 
+   // ── H1 Data ──
    s += "\"h1\":" + BuildTFData(PERIOD_H1) + ",";
 
-   //  M15 Data 
+   // ── M15 Data ──
    s += "\"m15\":" + BuildTFData(PERIOD_M15) + ",";
 
-   //  M5 Data (Entry TF  ) 
+   // ── M5 Data (Entry TF — ส่งมากกว่าพิเศษ) ──
    s += "\"m5\":" + BuildTFData(PERIOD_M5) + ",";
 
    // Open Orders
@@ -180,7 +287,7 @@ string BuildTFData(int tf)
 {
    int bars = CandleCount;
 
-   // Indicators  TF 
+   // Indicators สำหรับ TF นี้
    double ema20  = iMA(NULL, tf, 20,  0, MODE_EMA, PRICE_CLOSE, 0);
    double ema50  = iMA(NULL, tf, 50,  0, MODE_EMA, PRICE_CLOSE, 0);
    double ema200 = iMA(NULL, tf, 200, 0, MODE_EMA, PRICE_CLOSE, 0);
@@ -194,11 +301,11 @@ string BuildTFData(int tf)
    double stochK = iStochastic(NULL, tf, 5, 3, 3, MODE_SMA, 0, MODE_MAIN,   0);
    double stochD = iStochastic(NULL, tf, 5, 3, 3, MODE_SMA, 0, MODE_SIGNAL, 0);
 
-   // Swing High/Low (5 )
+   // Swing High/Low (5 แท่งล่าสุด)
    double swingHigh = High[iHighest(NULL, tf, MODE_HIGH, 10, 1)];
    double swingLow  = Low[iLowest(NULL,  tf, MODE_LOW,  10, 1)];
 
-   // Close 
+   // Close ล่าสุด
    double lastClose = iClose(NULL, tf, 1);
    double prevClose = iClose(NULL, tf, 2);
 
@@ -254,5 +361,3 @@ int CountDailyTrades()
    }
    return cnt;
 }
-
-
