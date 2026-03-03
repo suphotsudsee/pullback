@@ -21,7 +21,7 @@ input int      MaxSlippage       = 50;
 input bool     EnableTrading     = true;
 input bool     ReadCommandFromFile = true;
 input string   CommandFileName     = "pullback_command.json";
-input bool     UseCommonFiles      = false;
+input bool     UseCommonFiles      = true;
 input bool     SyncDisplayWithSender = true;
 input string   MarketDataFileName    = "pullback_market_data.json";
 
@@ -150,6 +150,10 @@ int OnInit()
    Print("   ATR M5: $", DoubleToString(atr_m5, 2));
    Print("   SL    : $", DoubleToString(atr_m5 * SL_ATR_Multi, 2));
    Print("   TP    : $", DoubleToString(atr_m5 * TP_ATR_Multi, 2));
+   string basePath = TerminalInfoString(TERMINAL_DATA_PATH) + "\\MQL4\\Files\\";
+   if(UseCommonFiles) basePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Files\\";
+   Print("   FileBridge Cmd : ", basePath, CommandFileName);
+   Print("   FileBridge Mkt : ", basePath, MarketDataFileName);
    return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)

@@ -19,7 +19,7 @@ input bool     UseMagicFilter  = true;
 input int      MagicFilter     = 55555;
 input bool     WriteToFileBridge = true;                 // เขียน JSON ลง MQL4\Files
 input string   OutputFileName    = "pullback_market_data.json";
-input bool     UseCommonFiles    = false;                // true = เขียนที่ Terminal\Common\Files
+input bool     UseCommonFiles    = true;                 // true = เขียนที่ Terminal\Common\Files
 input bool     SendToServer      = false;                // ปิด WebRequest ถ้าใช้โหมดไฟล์อย่างเดียว
 
 double   g_StartBalance = 0;

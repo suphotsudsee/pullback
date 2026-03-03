@@ -34,7 +34,7 @@ SERVER_HOST        = "0.0.0.0"
 SERVER_PORT        = 5000
 MT4_FILES_DIR      = os.getenv(
     "MT4_FILES_DIR",
-    r"C:\Users\user\AppData\Roaming\MetaQuotes\Terminal\C419E35F6EFCAC731FACC09E5EB1D6BB\MQL4\Files"
+    r"C:\Users\user\AppData\Roaming\MetaQuotes\Terminal\Common\Files"
 )
 MT4_MARKET_FILE    = os.getenv("MT4_MARKET_FILE", "pullback_market_data.json")
 MT4_COMMAND_FILE   = os.getenv("MT4_COMMAND_FILE", "pullback_command.json")
