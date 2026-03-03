@@ -22,6 +22,8 @@ input bool     EnableTrading     = true;
 input bool     ReadCommandFromFile = true;
 input string   CommandFileName     = "pullback_command.json";
 input bool     UseCommonFiles      = false;
+input bool     SyncDisplayWithSender = true;
+input string   MarketDataFileName    = "pullback_market_data.json";
 
 // ATR settings
 input int      ATR_Period        = 14;
@@ -64,6 +66,60 @@ bool ReadCommandFromFileBridge(string &outJson)
    outJson = FileReadString(h, sz);
    FileClose(h);
    return StringLen(outJson) > 4;
+}
+
+bool ReadMarketDataFromFileBridge(string &outJson)
+{
+   int flags = FILE_READ | FILE_TXT | FILE_ANSI;
+   if(UseCommonFiles) flags |= FILE_COMMON;
+
+   int h = FileOpen(MarketDataFileName, flags);
+   if(h == INVALID_HANDLE) return false;
+
+   int sz = (int)FileSize(h);
+   if(sz <= 0) { FileClose(h); return false; }
+   outJson = FileReadString(h, sz);
+   FileClose(h);
+   return StringLen(outJson) > 8;
+}
+
+string ExtractObject(string json, string key)
+{
+   string token = "\"" + key + "\":";
+   int p = StringFind(json, token);
+   if(p < 0) return "";
+   p += StringLen(token);
+   while(p < StringLen(json) && StringSubstr(json, p, 1) == " ")
+      p++;
+   if(StringSubstr(json, p, 1) != "{") return "";
+
+   int start = p;
+   int depth = 0;
+   for(int i = p; i < StringLen(json); i++) {
+      string ch = StringSubstr(json, i, 1);
+      if(ch == "{") depth++;
+      else if(ch == "}") {
+         depth--;
+         if(depth == 0)
+            return StringSubstr(json, start, i - start + 1);
+      }
+   }
+   return "";
+}
+
+string TrendFromSection(string sec, double fallbackPrice)
+{
+   double e20  = ExtractDouble(sec, "ema20");
+   double e50  = ExtractDouble(sec, "ema50");
+   double e200 = ExtractDouble(sec, "ema200");
+
+   if(e20 <= 0 || e50 <= 0 || e200 <= 0) {
+      if(fallbackPrice <= 0) return "MIXED";
+      return "MIXED";
+   }
+   if(e20 > e50 && e50 > e200) return "UP";
+   if(e20 < e50 && e50 < e200) return "DOWN";
+   return "MIXED";
 }
 
 void ClearCommandFileBridge()
@@ -268,6 +324,10 @@ void ProcessCommand(string json)
    string action = ExtractString(json, "action");
    string reason = ExtractString(json, "reason");
    string setup  = ExtractString(json, "setup");
+   if(StringLen(action) == 0) {
+      Print("Command parse failed: action is empty | json=", json);
+      return;
+   }
    bool   isManual = (setup == "MANUAL");
 
    string prefix = isManual ? "MANUAL" : "AI Pullback";
@@ -432,6 +492,45 @@ void UpdateChart()
 
    string h4Trend = (Bid > ema_h4) ? "UP" : "DOWN";
    string h1Trend = (Bid > ema_h1) ? "UP" : "DOWN";
+   double dispBid = Bid;
+   double dispAsk = Ask;
+   double spread  = Ask - Bid;
+
+   if(SyncDisplayWithSender) {
+      string snap = "";
+      if(ReadMarketDataFromFileBridge(snap)) {
+         double b = ExtractDouble(snap, "bid");
+         double a = ExtractDouble(snap, "ask");
+         double s = ExtractDouble(snap, "spread_usd");
+         if(b > 0) dispBid = b;
+         if(a > 0) dispAsk = a;
+         if(s > 0) spread = s;
+
+         string h4 = ExtractObject(snap, "h4");
+         string h1 = ExtractObject(snap, "h1");
+         string m15= ExtractObject(snap, "m15");
+         string m5 = ExtractObject(snap, "m5");
+
+         if(StringLen(h4) > 0) {
+            double v = ExtractDouble(h4, "atr"); if(v > 0) atr_h4 = v;
+            v = ExtractDouble(h4, "rsi"); if(v > 0) rsi_h4 = v;
+            h4Trend = TrendFromSection(h4, dispBid);
+         }
+         if(StringLen(h1) > 0) {
+            double v = ExtractDouble(h1, "atr"); if(v > 0) atr_h1 = v;
+            v = ExtractDouble(h1, "rsi"); if(v > 0) rsi_h1 = v;
+            h1Trend = TrendFromSection(h1, dispBid);
+         }
+         if(StringLen(m15) > 0) {
+            double v = ExtractDouble(m15, "atr"); if(v > 0) atr_m15 = v;
+            v = ExtractDouble(m15, "rsi"); if(v > 0) rsi_m15 = v;
+         }
+         if(StringLen(m5) > 0) {
+            double v = ExtractDouble(m5, "atr"); if(v > 0) atr_m5 = v;
+            v = ExtractDouble(m5, "rsi"); if(v > 0) rsi_m5 = v;
+         }
+      }
+   }
 
    string status;
    if(g_DailyBlocked)                    status = "BLOCKED";
@@ -442,8 +541,8 @@ void UpdateChart()
 
    Comment(
       "XAUUSD Pullback AI v5\n",
-      "Price : $", DoubleToString(Bid,2), " / $", DoubleToString(Ask,2), "\n",
-      "Spread: $", DoubleToString(Ask-Bid,2), "\n",
+      "Price : $", DoubleToString(dispBid,2), " / $", DoubleToString(dispAsk,2), "\n",
+      "Spread: $", DoubleToString(spread,2), "\n",
       "\n",
       "TIMEFRAME ANALYSIS\n",
       "H4  : ", h4Trend, "  RSI=", DoubleToString(rsi_h4,0),  "  ATR=$", DoubleToString(atr_h4,2), "\n",
@@ -480,18 +579,28 @@ void SendResult(int ticket, string tp, bool ok, string err, string source = "AI"
 
 string ExtractString(string json, string key)
 {
-   string s = "\"" + key + "\":\"";
+   string s = "\"" + key + "\"";
    int p = StringFind(json, s); if(p<0) return "";
    p += StringLen(s);
+   while(p < StringLen(json) && StringSubstr(json,p,1) == " ") p++;
+   if(p >= StringLen(json) || StringSubstr(json,p,1) != ":") return "";
+   p++;
+   while(p < StringLen(json) && StringSubstr(json,p,1) == " ") p++;
+   if(p >= StringLen(json) || StringSubstr(json,p,1) != "\"") return "";
+   p++;
    int e = StringFind(json,"\"",p);
    return(e<0)?"":StringSubstr(json,p,e-p);
 }
 
 double ExtractDouble(string json, string key)
 {
-   string s = "\"" + key + "\":";
+   string s = "\"" + key + "\"";
    int p = StringFind(json, s); if(p<0) return 0;
    p += StringLen(s);
+   while(p < StringLen(json) && StringSubstr(json,p,1) == " ") p++;
+   if(p >= StringLen(json) || StringSubstr(json,p,1) != ":") return 0;
+   p++;
+   while(p < StringLen(json) && StringSubstr(json,p,1) == " ") p++;
    string val = "";
    for(int i=p;i<StringLen(json);i++){
       string ch=StringSubstr(json,i,1);

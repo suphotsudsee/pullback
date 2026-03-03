@@ -39,6 +39,7 @@ MT4_FILES_DIR      = os.getenv(
 MT4_MARKET_FILE    = os.getenv("MT4_MARKET_FILE", "pullback_market_data.json")
 MT4_COMMAND_FILE   = os.getenv("MT4_COMMAND_FILE", "pullback_command.json")
 FILE_POLL_SEC      = float(os.getenv("FILE_POLL_SEC", "0.25"))
+ORDER_ACK_TIMEOUT_SEC = int(os.getenv("ORDER_ACK_TIMEOUT_SEC", "12"))
 
 FIXED_LOT          = 0.01
 MAX_DAILY_TRADES   = 3
@@ -80,6 +81,46 @@ _daily_date    = None
 _daily_trades  = 0
 _daily_blocked = False
 _last_file_mtime_ns = -1
+order_status = {
+    "stage": "idle",
+    "action": "-",
+    "msg": "No order yet",
+    "time": "-",
+    "ticket": "-",
+    "source": "-",
+    "ts": 0.0,
+}
+
+
+def set_order_status(stage: str, action: str, msg: str, ticket: str = "-", source: str = "-") -> None:
+    order_status.update({
+        "stage": stage,
+        "action": action,
+        "msg": msg,
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "ticket": str(ticket),
+        "source": source,
+        "ts": time.time(),
+    })
+
+
+def get_effective_order_status() -> dict:
+    st = dict(order_status)
+    stage = str(st.get("stage", "idle"))
+    ts = float(st.get("ts", 0) or 0)
+    if stage in ("queued", "sent_to_ea") and ts > 0:
+        age = time.time() - ts
+        if age >= ORDER_ACK_TIMEOUT_SEC:
+            # No callback from EA in time -> mark failed instead of hanging on QUEUED
+            set_order_status(
+                "failed",
+                str(st.get("action", "-")),
+                "No response from EA (timeout). Check MT4 login mode, AutoTrading, WebRequest whitelist.",
+                ticket=str(st.get("ticket", "-")),
+                source=str(st.get("source", "-")),
+            )
+            st = dict(order_status)
+    return st
 
 
 def write_command_file(cmd: dict) -> None:
@@ -89,7 +130,7 @@ def write_command_file(cmd: dict) -> None:
         payload = dict(cmd)
         payload.setdefault("cmd_id", str(int(time.time() * 1000)))
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
         log.info(f"Command file updated: {path} | action={payload.get('action')}")
     except Exception as e:
         log.error(f"Command file write error: {e}")
@@ -259,6 +300,7 @@ def queue_command_if_valid(cmd: dict, data: dict, source: str) -> None:
     with command_lock:
         pending_command = cmd
     write_command_file(cmd)
+    set_order_status("queued", action, f"{source} queued and waiting EA", ticket=cmd["cmd_id"], source=source)
     log.info(f"{source} command queued: {cmd}")
 
 
@@ -328,6 +370,16 @@ def receive_order_result():
     global _daily_trades
     data = request.get_json(force=True, silent=True)
     log.info(f" Order: {json.dumps(data, ensure_ascii=False)}")
+    if data:
+        action = str(data.get("type", "-")).upper()
+        source = str(data.get("source", "-"))
+        ticket = data.get("ticket", "-")
+        if data.get("success"):
+            set_order_status("filled", action, "Order filled", ticket=ticket, source=source)
+        else:
+            err = str(data.get("error", "") or "Order failed")
+            set_order_status("failed", action, err, ticket=ticket, source=source)
+
     if data and data.get("success"):
         check_daily_reset()
         _daily_trades += 1
@@ -350,8 +402,14 @@ def get_command():
             cmd = pending_command
             pending_command = None
             log.info(f" EA : {cmd}")
+            set_order_status("sent_to_ea", str(cmd.get("action", "-")).upper(), "EA polled command", ticket=cmd.get("cmd_id", "-"), source="AI")
             return jsonify(cmd)
     return jsonify({"action": "none"})
+
+
+@app.route("/order_status", methods=["GET"])
+def get_order_status():
+    return jsonify(get_effective_order_status())
 
 
 # 
@@ -362,10 +420,12 @@ def manual_order():
     global pending_command
     data = request.get_json(force=True, silent=True)
     if not data:
+        set_order_status("failed", "-", "Invalid manual order JSON", source="MANUAL")
         return jsonify({"status": "error", "msg": "invalid JSON"}), 400
 
     action = str(data.get("action", "")).upper()
     if action not in ("BUY", "SELL", "CLOSE"):
+        set_order_status("failed", action or "-", "Manual action must be BUY/SELL/CLOSE", source="MANUAL")
         return jsonify({"status": "error", "msg": "action must be BUY/SELL/CLOSE"}), 400
 
     check_daily_reset()
@@ -376,6 +436,7 @@ def manual_order():
         allowed, reason = risk_check(last_data)
         if not allowed:
             log.warning(f"Manual {action} blocked: {reason}")
+            set_order_status("failed", action, reason, source="MANUAL")
             return jsonify({"status": "blocked", "msg": reason}), 403
 
     cmd = {
@@ -391,6 +452,7 @@ def manual_order():
     with command_lock:
         pending_command = cmd
     write_command_file(cmd)
+    set_order_status("queued", action, "Queued and waiting EA", ticket=cmd["cmd_id"], source="MANUAL")
 
     log.info(f"Manual {action} queued, waiting for EA poll")
     return jsonify({"status": "queued", "action": action})
@@ -708,6 +770,23 @@ def dashboard():
 
     action_color = {"BUY":"#10b981","SELL":"#ef4444"}.get(ai_action, "#94a3b8")
 
+    current_status = get_effective_order_status()
+    stg = str(current_status.get("stage", "idle"))
+    status_color = {
+        "idle": "#64748b",
+        "queued": "#f59e0b",
+        "sent_to_ea": "#38bdf8",
+        "filled": "#10b981",
+        "failed": "#ef4444",
+    }.get(stg, "#64748b")
+    status_title = {
+        "idle": "IDLE",
+        "queued": "QUEUED",
+        "sent_to_ea": "SENT TO EA",
+        "filled": "FILLED",
+        "failed": "FAILED",
+    }.get(stg, stg.upper())
+
     rows = ""
     for t in reversed(trade_log[-6:]):
         c = "#10b981" if t['type']=="BUY" else "#ef4444"
@@ -752,6 +831,14 @@ td{{padding:5px 8px;border-bottom:1px solid #0f172a}}
 <div class="sub">Multi-Timeframe: H4 -> H1 -> M15 -> M5 Entry | refresh every 3s</div>
 
 {blocked_html}
+
+<div class="card" style="margin-bottom:10px;border-color:{status_color}">
+  <h3>Order Status</h3>
+  <div class="val" style="color:{status_color}">{status_title}</div>
+  <div class="sub2">Action: <b>{current_status.get('action','-')}</b> | Source: <b>{current_status.get('source','-')}</b></div>
+  <div class="sub2">Ticket/Cmd: <b>{current_status.get('ticket','-')}</b> | Time: <b>{current_status.get('time','-')}</b></div>
+  <div class="sub2" style="color:#cbd5e1">{current_status.get('msg','-')}</div>
+</div>
 
 <div class="g3">
   <div class="card">
@@ -894,7 +981,6 @@ td{{padding:5px 8px;border-bottom:1px solid #0f172a}}
 
 <script>
 async function sendManual(action) {{
-  const btn = document.getElementById('btn-' + action.toLowerCase());
   const status = document.getElementById('order-status');
 
   // Disable buttons while request is in-flight
@@ -922,7 +1008,8 @@ async function sendManual(action) {{
     if (res.ok && data.status === 'queued') {{
       status.style.background = '#064e3b';
       status.style.color = '#6ee7b7';
-      status.textContent = action + ' queued successfully. Waiting for EA poll (~3s)';
+      status.textContent = action + ' queued. Waiting EA result...';
+      waitOrderResult(action);
     }} else if (res.status === 403) {{
       status.style.background = '#450a0a';
       status.style.color = '#fca5a5';
@@ -945,11 +1032,47 @@ async function sendManual(action) {{
       document.getElementById('btn-' + b).style.opacity = '1';
     }});
   }}, 4000);
+}}
 
-  // Hide status after 6 seconds
-  setTimeout(() => {{
-    status.style.display = 'none';
-  }}, 6000);
+async function waitOrderResult(expectedAction) {{
+  const status = document.getElementById('order-status');
+  const start = Date.now();
+  const timeoutMs = 30000;
+  while (Date.now() - start < timeoutMs) {{
+    try {{
+      const r = await fetch('/order_status');
+      const s = await r.json();
+      const stage = (s.stage || '').toLowerCase();
+      const act = (s.action || '').toUpperCase();
+
+      if (act && act !== '-' && act !== expectedAction) {{
+        await new Promise(x => setTimeout(x, 800));
+        continue;
+      }}
+
+      if (stage === 'filled') {{
+        status.style.background = '#064e3b';
+        status.style.color = '#6ee7b7';
+        status.textContent = 'FILLED | ' + s.action + ' | ticket ' + s.ticket + ' | ' + s.msg;
+        return;
+      }}
+      if (stage === 'failed') {{
+        status.style.background = '#450a0a';
+        status.style.color = '#fca5a5';
+        status.textContent = 'FAILED | ' + s.action + ' | ' + s.msg;
+        return;
+      }}
+      if (stage === 'sent_to_ea') {{
+        status.style.background = '#0c4a6e';
+        status.style.color = '#7dd3fc';
+        status.textContent = 'SENT TO EA | ' + s.action + ' | waiting broker response...';
+      }}
+    }} catch (e) {{}}
+    await new Promise(x => setTimeout(x, 1000));
+  }}
+  status.style.background = '#451a03';
+  status.style.color = '#fed7aa';
+  status.textContent = 'Timeout waiting order result. Check MT4 Experts/Journal.';
 }}
 
 // Hover effects
