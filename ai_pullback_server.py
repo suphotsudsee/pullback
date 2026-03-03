@@ -55,6 +55,7 @@ LATE_MAX_EMA20_ATR = float(os.getenv("LATE_MAX_EMA20_ATR", "0.5"))
 LATE_MAX_CANDLE_ATR = float(os.getenv("LATE_MAX_CANDLE_ATR", "1.2"))
 LATE_STOCH_BUY_MAX = float(os.getenv("LATE_STOCH_BUY_MAX", "95"))
 LATE_STOCH_SELL_MIN = float(os.getenv("LATE_STOCH_SELL_MIN", "5"))
+TREND_FILTER_MODE = os.getenv("TREND_FILTER_MODE", "strict_h4_h1")  # strict_h4_h1 | h4_only
 MIN_ATR_M5         = 1.5
 MAX_SPREAD_USD     = 3.0
 
@@ -776,6 +777,42 @@ def parse_response(text: str, data: dict) -> dict:
     open_pos = data.get("account", {}).get("open_pos", 0)
     if action in ("BUY", "SELL") and int(open_pos or 0) >= MAX_DAILY_TRADES:
         return {"action": "none"}
+
+    # Enforce directional pullback on both sides:
+    # Uptrend -> BUY pullback only, Downtrend -> SELL pullback only.
+    bid = float(data.get("bid", 0) or 0)
+    h4 = data.get("h4", {}) or {}
+    h1 = data.get("h1", {}) or {}
+
+    def tf_dir(tf: dict) -> str:
+        e20 = float(tf.get("ema20", bid) or bid)
+        e50 = float(tf.get("ema50", bid) or bid)
+        e200 = float(tf.get("ema200", bid) or bid)
+        if e20 > e50 > e200:
+            return "UP"
+        if e20 < e50 < e200:
+            return "DOWN"
+        return "MIXED"
+
+    h4_dir = tf_dir(h4)
+    h1_dir = tf_dir(h1)
+    mode = str(TREND_FILTER_MODE or "strict_h4_h1").strip().lower()
+
+    if mode == "h4_only":
+        if action == "BUY" and h4_dir != "UP":
+            log.info(f" Reject BUY: H4 dir={h4_dir} (mode=h4_only)")
+            return {"action": "none"}
+        if action == "SELL" and h4_dir != "DOWN":
+            log.info(f" Reject SELL: H4 dir={h4_dir} (mode=h4_only)")
+            return {"action": "none"}
+    else:
+        # strict_h4_h1: require H4 and H1 to align with action
+        if action == "BUY" and not (h4_dir == "UP" and h1_dir == "UP"):
+            log.info(f" Reject BUY: H4/H1 dir={h4_dir}/{h1_dir} (mode=strict_h4_h1)")
+            return {"action": "none"}
+        if action == "SELL" and not (h4_dir == "DOWN" and h1_dir == "DOWN"):
+            log.info(f" Reject SELL: H4/H1 dir={h4_dir}/{h1_dir} (mode=strict_h4_h1)")
+            return {"action": "none"}
 
     cmd["action"] = action
     cmd["lots"]   = FIXED_LOT
