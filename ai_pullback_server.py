@@ -40,6 +40,7 @@ MT4_MARKET_FILE    = os.getenv("MT4_MARKET_FILE", "pullback_market_data.json")
 MT4_COMMAND_FILE   = os.getenv("MT4_COMMAND_FILE", "pullback_command.json")
 FILE_POLL_SEC      = float(os.getenv("FILE_POLL_SEC", "0.05"))
 ORDER_ACK_TIMEOUT_SEC = int(os.getenv("ORDER_ACK_TIMEOUT_SEC", "8"))
+ORDER_STATUS_RESET_SEC = int(os.getenv("ORDER_STATUS_RESET_SEC", "8"))
 
 FIXED_LOT          = 0.01
 MAX_DAILY_TRADES   = 3
@@ -50,6 +51,10 @@ AI_COOLDOWN_SEC    = 300       # Pause AI calls for 5 minutes after HTTP 429
 USE_RULE_FALLBACK_ON_AI_ERROR = True
 RULE_MIN_CONFIDENCE = int(os.getenv("RULE_MIN_CONFIDENCE", "72"))
 RULE_ALIGN_CONFIDENCE = int(os.getenv("RULE_ALIGN_CONFIDENCE", "76"))
+LATE_MAX_EMA20_ATR = float(os.getenv("LATE_MAX_EMA20_ATR", "0.5"))
+LATE_MAX_CANDLE_ATR = float(os.getenv("LATE_MAX_CANDLE_ATR", "1.2"))
+LATE_STOCH_BUY_MAX = float(os.getenv("LATE_STOCH_BUY_MAX", "95"))
+LATE_STOCH_SELL_MIN = float(os.getenv("LATE_STOCH_SELL_MIN", "5"))
 MIN_ATR_M5         = 1.5
 MAX_SPREAD_USD     = 3.0
 
@@ -81,6 +86,7 @@ _daily_date    = None
 _daily_trades  = 0
 _daily_blocked = False
 _last_file_mtime_ns = -1
+_last_file_lock_warn_ts = 0.0
 order_status = {
     "stage": "idle",
     "action": "-",
@@ -120,7 +126,48 @@ def get_effective_order_status() -> dict:
                 source=str(st.get("source", "-")),
             )
             st = dict(order_status)
+    stage = str(st.get("stage", "idle"))
+    ts = float(st.get("ts", 0) or 0)
+    if stage in ("filled", "failed") and ts > 0:
+        if (time.time() - ts) >= ORDER_STATUS_RESET_SEC:
+            set_order_status("idle", "-", "No order yet", ticket="-", source="-")
+            st = dict(order_status)
     return st
+
+
+def late_entry_check(data: dict, action: str) -> tuple[bool, str]:
+    action = str(action or "").upper()
+    if action not in ("BUY", "SELL"):
+        return True, "ok"
+
+    bid = float(data.get("bid", 0) or 0)
+    m5 = (data.get("m5") or {})
+    atr = float(m5.get("atr", 0) or 0)
+    ema20 = float(m5.get("ema20", bid) or bid)
+    stoch = float(m5.get("stoch_k", 50) or 50)
+    candles = m5.get("candles", []) or []
+
+    if atr <= 0:
+        return True, "ok"
+
+    dist_ema20 = abs(bid - ema20)
+    if dist_ema20 > (LATE_MAX_EMA20_ATR * atr):
+        return False, f"Too late: price extended from EMA20 ({dist_ema20:.2f} > {LATE_MAX_EMA20_ATR:.2f}xATR)"
+
+    if candles:
+        last_candle = candles[-1]
+        h = float(last_candle.get("h", bid) or bid)
+        l = float(last_candle.get("l", bid) or bid)
+        rng = abs(h - l)
+        if rng > (LATE_MAX_CANDLE_ATR * atr):
+            return False, f"Too late: impulse candle too large ({rng:.2f} > {LATE_MAX_CANDLE_ATR:.2f}xATR)"
+
+    if action == "BUY" and stoch >= LATE_STOCH_BUY_MAX:
+        return False, f"Too late: Stoch too high ({stoch:.1f})"
+    if action == "SELL" and stoch <= LATE_STOCH_SELL_MIN:
+        return False, f"Too late: Stoch too low ({stoch:.1f})"
+
+    return True, "ok"
 
 
 def write_command_file(cmd: dict) -> None:
@@ -290,6 +337,13 @@ def queue_command_if_valid(cmd: dict, data: dict, source: str) -> None:
     if action not in ("BUY", "SELL", "CLOSE") or confidence < MIN_CONFIDENCE:
         return
 
+    if source != "MANUAL" and action in ("BUY", "SELL"):
+        ok_timing, timing_msg = late_entry_check(data, action)
+        if not ok_timing:
+            set_order_status("failed", action, timing_msg, ticket=cmd.get("cmd_id", "-"), source=source)
+            log.info(f"{source} skipped ({action}): {timing_msg}")
+            return
+
     open_pos = int((data.get("account", {}) or {}).get("open_pos", 0) or 0)
     if action in ("BUY", "SELL") and open_pos >= MAX_DAILY_TRADES:
         return
@@ -305,7 +359,7 @@ def queue_command_if_valid(cmd: dict, data: dict, source: str) -> None:
 
 
 def watch_mt4_file() -> None:
-    global _last_file_mtime_ns
+    global _last_file_mtime_ns, _last_file_lock_warn_ts
     file_path = os.path.join(MT4_FILES_DIR, MT4_MARKET_FILE)
     log.info(f"FileBridge watch: {file_path}")
 
@@ -321,9 +375,15 @@ def watch_mt4_file() -> None:
                 continue
 
             _last_file_mtime_ns = stat.st_mtime_ns
-            with open(file_path, "r", encoding="utf-8-sig") as f:
-                raw = f.read().strip()
-
+            raw = ""
+            # MT4 may hold the file lock briefly while writing.
+            for _ in range(3):
+                try:
+                    with open(file_path, "r", encoding="utf-8-sig") as f:
+                        raw = f.read().strip()
+                    break
+                except PermissionError:
+                    time.sleep(0.02)
             if not raw:
                 time.sleep(FILE_POLL_SEC)
                 continue
@@ -335,6 +395,13 @@ def watch_mt4_file() -> None:
                 log.warning("FileBridge ignored non-object JSON payload")
         except json.JSONDecodeError:
             # EA อาจกำลังเขียนไฟล์อยู่ จึงรอรอบถัดไป
+            time.sleep(FILE_POLL_SEC)
+            continue
+        except PermissionError:
+            now = time.time()
+            if now - _last_file_lock_warn_ts >= 5:
+                _last_file_lock_warn_ts = now
+                log.warning("FileBridge: market data file is locked by MT4, retrying...")
             time.sleep(FILE_POLL_SEC)
             continue
         except Exception as e:
