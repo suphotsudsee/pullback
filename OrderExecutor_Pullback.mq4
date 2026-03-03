@@ -52,6 +52,8 @@ int      g_DailyTrades   = 0;
 datetime g_LastDay       = 0;
 bool     g_DailyBlocked  = false;
 string   g_LastCmdID     = "";
+string   g_SLLineName    = "PB_SL_LINE";
+string   g_TPLineName    = "PB_TP_LINE";
 
 bool ReadCommandFromFileBridge(string &outJson)
 {
@@ -150,7 +152,13 @@ int OnInit()
    Print("   TP    : $", DoubleToString(atr_m5 * TP_ATR_Multi, 2));
    return INIT_SUCCEEDED;
 }
-void OnDeinit(const int reason) { EventKillTimer(); Comment(""); }
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   ObjectDelete(0, g_SLLineName);
+   ObjectDelete(0, g_TPLineName);
+   Comment("");
+}
 
 //+------------------------------------------------------------------+
 void OnTimer()
@@ -195,7 +203,63 @@ void OnTimer()
 }
 
 //+------------------------------------------------------------------+
-void OnTick() { UpdateChart(); }
+void OnTick() { UpdateSLTPLines(); UpdateChart(); }
+
+void UpdateSLTPLines()
+{
+   int bestTicket = -1;
+   datetime bestOpen = 0;
+   double sl = 0.0, tp = 0.0;
+   int orderType = -1;
+
+   for(int i = 0; i < OrdersTotal(); i++) {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderMagicNumber() != MagicNumber) continue;
+      if(OrderSymbol() != Symbol()) continue;
+      if(OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+
+      if(OrderOpenTime() >= bestOpen) {
+         bestOpen   = OrderOpenTime();
+         bestTicket = OrderTicket();
+         sl         = OrderStopLoss();
+         tp         = OrderTakeProfit();
+         orderType  = OrderType();
+      }
+   }
+
+   if(bestTicket < 0) {
+      ObjectDelete(0, g_SLLineName);
+      ObjectDelete(0, g_TPLineName);
+      return;
+   }
+
+   color slColor = (orderType == OP_BUY) ? clrTomato : clrAqua;
+   color tpColor = (orderType == OP_BUY) ? clrLimeGreen : clrOrange;
+
+   if(sl > 0) {
+      if(ObjectFind(0, g_SLLineName) < 0)
+         ObjectCreate(0, g_SLLineName, OBJ_HLINE, 0, 0, sl);
+      ObjectSetDouble(0, g_SLLineName, OBJPROP_PRICE1, sl);
+      ObjectSetInteger(0, g_SLLineName, OBJPROP_COLOR, slColor);
+      ObjectSetInteger(0, g_SLLineName, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, g_SLLineName, OBJPROP_WIDTH, 2);
+      ObjectSetString(0, g_SLLineName, OBJPROP_TEXT, "SL #" + IntegerToString(bestTicket));
+   } else {
+      ObjectDelete(0, g_SLLineName);
+   }
+
+   if(tp > 0) {
+      if(ObjectFind(0, g_TPLineName) < 0)
+         ObjectCreate(0, g_TPLineName, OBJ_HLINE, 0, 0, tp);
+      ObjectSetDouble(0, g_TPLineName, OBJPROP_PRICE1, tp);
+      ObjectSetInteger(0, g_TPLineName, OBJPROP_COLOR, tpColor);
+      ObjectSetInteger(0, g_TPLineName, OBJPROP_STYLE, STYLE_DASHDOT);
+      ObjectSetInteger(0, g_TPLineName, OBJPROP_WIDTH, 2);
+      ObjectSetString(0, g_TPLineName, OBJPROP_TEXT, "TP #" + IntegerToString(bestTicket));
+   } else {
+      ObjectDelete(0, g_TPLineName);
+   }
+}
 
 //+------------------------------------------------------------------+
 double GetATR_M5()

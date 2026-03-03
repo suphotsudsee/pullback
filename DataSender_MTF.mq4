@@ -15,6 +15,8 @@ input string   FallbackURL3  = "";
 input int      SendInterval  = 1;    // ส่งทุก 1 วินาที
 input int      CandleCount   = 30;   // candle ต่อ timeframe
 input bool     EnableFallback = true;
+input bool     UseMagicFilter  = true;
+input int      MagicFilter     = 55555;
 input bool     WriteToFileBridge = true;                 // เขียน JSON ลง MQL4\Files
 input string   OutputFileName    = "pullback_market_data.json";
 input bool     UseCommonFiles    = false;                // true = เขียนที่ Terminal\Common\Files
@@ -28,6 +30,15 @@ string   g_ServerList[4];
 string   g_WhitelistList[4];
 int      g_ServerCount  = 0;
 int      g_ServerIndex  = 0;
+
+bool PassTradeFilter()
+{
+   if(OrderSymbol() != Symbol()) return false;
+   if(UseMagicFilter && OrderMagicNumber() != MagicFilter) return false;
+   int type = OrderType();
+   if(type != OP_BUY && type != OP_SELL) return false;
+   return true;
+}
 
 bool WriteJSONToFile(string json)
 {
@@ -351,12 +362,15 @@ int CountDailyTrades()
 {
    datetime today = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
    int cnt = 0;
+
    for(int i = OrdersHistoryTotal()-1; i >= 0; i--) {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(!PassTradeFilter()) continue;
       if(StringToTime(TimeToString(OrderCloseTime(), TIME_DATE)) == today) cnt++;
    }
    for(int j = 0; j < OrdersTotal(); j++) {
       if(!OrderSelect(j, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(!PassTradeFilter()) continue;
       if(StringToTime(TimeToString(OrderOpenTime(), TIME_DATE)) == today) cnt++;
    }
    return cnt;
